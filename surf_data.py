@@ -18,6 +18,39 @@ def deg_to_compass(deg: float | None) -> str:
     idx = int((deg + 11.25) / 22.5) % 16
     return COMPASS[idx]
 
+def in_angle_range(deg: float | None, bounds: list[int]) -> bool:
+    if deg is None:
+        return False
+    low, high = bounds
+    if low <= high:
+        return low <= deg <= high
+    return deg >= low or deg <= high  # Handles wrap-around across 360°/0°
+
+
+def tag_conditions(spot: dict, swell_dir: float | None, wind_dir: float | None, wind_mph: float | None, tide_ft: float | None) -> dict:
+    # Wind quality
+    if wind_mph is None or wind_mph < 4:
+        wind_q = "glassy"
+    elif in_angle_range(wind_dir, spot["offshore_wind_deg"]):
+        wind_q = "offshore"
+    else:
+        wind_q = "onshore_or_cross"
+
+    # Tide fit
+    t_low, t_high = spot["optimal_tide_ft"]
+    if tide_ft is None:
+        tide_q = "unknown"
+    elif t_low <= tide_ft <= t_high:
+        tide_q = "optimal"
+    elif tide_ft < t_low:
+        tide_q = "too_low"
+    else:
+        tide_q = "too_high"
+
+    # Swell window
+    swell_q = "in_window" if in_angle_range(swell_dir, spot["optimal_swell_deg"]) else "outside_window"
+
+    return {"wind_quality": wind_q, "tide_fit": tide_q, "swell_fit": swell_q}
 
 def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 3958.8
