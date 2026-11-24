@@ -66,7 +66,6 @@ DECISION RULES:
         "gemini-3.5-flash-lite",
     ]
 
-    last_err = None
     for model_name in models_to_try:
         for attempt in range(2):
             try:
@@ -81,10 +80,77 @@ DECISION RULES:
                 )
                 return SurfDecision.model_validate_json(response.text)
             except (errors.ServerError, errors.ClientError) as e:
-                last_err = e
+                print(f"[SurfBrain] {model_name} attempt {attempt + 1} failed: {e}")
                 if attempt == 0:
                     time.sleep(1.5)
                 else:
-                    break  # Move immediately to the next fallback model
+                    break
 
-    raise last_err
+    # --- DETERMINISTIC FALLBACK (Never crashes on Gemini 503 outages) ---
+    return _fallback_surf_call(profile, window_mins, spot_forecasts)
+
+
+def _fallback_surf_call(profile: dict, window_mins: int, spot_forecasts: list[dict]) -> SurfDecision:
+    """Scores spots directly from live tags if Gemini is temporarily overloaded."""
+    rating_pts = {"EPIC": 5, "GOOD": 4, "FAIR_TO_GOOD": 3, "FAIR": 2, "POOR_TO_FAIR": 1, "POOR": -1, "VERY_POOR": -3}
+    scored = []
+
+    for item in spot_forecasts:
+        water_mins = max(0, window_mins - item["round_trip_logistics_mins"])
+        if water_mins < 30 or not item["hourly_forecast"]:
+            continue
+
+        best_hr = max(
+            item["hourly_forecast"],
+            key=lambda h: (
+                (3 if h.get("wind_quality") == "glassy" else 2 if h.get("wind_quality") == "offshore" else -2)
+                + (2 if h.get("tide_fit") == "optimal" else -1)
+                + (2 if h.get("swell_fit") == "in_window" else 0)
+                + rating_pts.get(h.get("surfline_rating"), 0)
+            ),
+        )
+        score = (
+            (3 if best_hr.get("wind_quality") == "glassy" else 2 if best_hr.get("wind_quality") == "offshore" else -2)
+            + (2 if best_hr.get("tide_fit") == "optimal" else -1)
+            + (2 if best_hr.get("swell_fit") == "in_window" else 0)
+            + rating_pts.get(best_hr.get("surfline_rating"), 0)
+        )
+        scored.append((score, item, best_hr, water_mins))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    quiver = profile.get("quiver") or ["mid-length"]
+
+    if not scored or scored[0][0] < 1:
+        return SurfDecision(
+            verdict="SKIP",
+            spot_name="Stay Dry",
+            paddle_out_time="N/A",
+            recommended_board=quiver[0],
+            est_water_time_mins=0,
+            the_call="Gemini is temporarily overloaded, and live buoy/wind tags show poor conditions across your radius.",
+            watch_out="Check the raw conditions table below for details.",
+            runner_up="None — wait for cleaner wind or a better tide window.",
+            board_sizing_tip="Save your energy for a cleaner window.",
+        )
+
+    top_score, top_item, top_hr, water_mins = scored[0]
+    verdict = "GO" if top_score >= 5 else "MAYBE"
+    runner = scored[1][1]["spot"]["name"] if len(scored) > 1 else "None within radius"
+    wave_ft = top_hr.get("surfline_max_ft") or top_hr.get("total_wave_ft") or 2.0
+    board = quiver[-1] if wave_ft < 3.0 else quiver[0]
+
+    return SurfDecision(
+        verdict=verdict,
+        spot_name=top_item["spot"]["name"],
+        paddle_out_time=top_hr["time"],
+        recommended_board=board,
+        est_water_time_mins=water_mins,
+        the_call=(
+            f"Best live window scores {top_hr['wind_quality']} wind, {top_hr['tide_fit']} tide "
+            f"({top_hr['tide_ft']} ft), and ~{wave_ft} ft surf. "
+            "(Gemini API is currently at capacity—call generated directly from live buoy, NOAA & Surfline data.)"
+        ),
+        watch_out=f"Wind is {top_hr.get('wind_mph')} mph ({top_hr.get('wind_dir')}); verify on the live cam before driving.",
+        runner_up=f"{runner} — next highest-scoring break in your radius.",
+        board_sizing_tip=f"Defaulting to your {board} for ~{wave_ft} ft conditions.",
+    )
