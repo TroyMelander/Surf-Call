@@ -3,3 +3,4 @@ requests
 pydantic
 google-genai
 pandas
+python-dotenv
