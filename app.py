@@ -33,7 +33,7 @@ def save_profile(profile: dict) -> None:
 
 st.set_page_config(page_title="Surf Call", page_icon="🏄", layout="centered")
 st.title("🏄 Surf Call")
-st.caption("Zero-thinking surf recommender powered by Open-Meteo, NOAA Tides & Gemini.")
+st.caption("Zero-thinking surf recommender powered by Open-Meteo, NOAA Tides, Surfline & Gemini.")
 
 profile = load_profile()
 
@@ -43,7 +43,7 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     home_lat = col1.number_input("Home Lat", value=float(profile["home_lat"]), format="%.4f")
     home_lon = col2.number_input("Home Lon", value=float(profile["home_lon"]), format="%.4f")
-    max_radius = st.slider("Max Radius (miles)", 3, 35, int(profile["max_radius_miles"]))
+    max_radius = st.slider("Max Radius (miles)", 3, 45, int(profile["max_radius_miles"]))
 
     skill = st.selectbox(
         "Skill Level",
@@ -56,6 +56,9 @@ with st.sidebar:
         value="\n".join(profile["quiver"]),
         height=90,
     )
+
+    st.divider()
+    use_surfline = st.checkbox("Include Surfline ratings (unofficial)", value=True)
 
     st.divider()
     st.caption("Optional (for board sizing tip)")
@@ -87,7 +90,7 @@ window_mins = (end_hr - start_hr) * 60
 window_label = f"{target_date.strftime('%A, %b %d')} from {start_hr}:00 to {end_hr}:00"
 
 if st.button("Make the Call", type="primary", use_container_width=True):
-    with st.spinner("Checking swell, wind, tides & drive times..."):
+    with st.spinner("Checking swell, wind, tides, Surfline & drive times..."):
         forecasts = get_window_forecasts(
             user_lat=home_lat,
             user_lon=home_lon,
@@ -95,6 +98,7 @@ if st.button("Make the Call", type="primary", use_container_width=True):
             target_date=target_date,
             start_hour=start_hr,
             end_hour=end_hr,
+            use_surfline=use_surfline,
         )
 
         if not forecasts:
@@ -116,10 +120,15 @@ if st.button("Make the Call", type="primary", use_container_width=True):
     st.markdown(f"**Heads up:** {decision.watch_out}")
     st.markdown(f"**Backup spot:** {decision.runner_up}")
 
+    # 1-Click Surfline Cam Link
+    matched = next((f["spot"] for f in forecasts if f["spot"]["name"] == decision.spot_name), None)
+    if matched and matched.get("surfline_url"):
+        st.link_button("Check Surfline Live Cam", matched["surfline_url"])
+
     with st.expander("Board Sizing & Volume Check"):
         st.write(decision.board_sizing_tip)
 
-    with st.expander("Raw Conditions Checked (Open-Meteo + NOAA)"):
+    with st.expander("Raw Conditions Checked (Open-Meteo + NOAA + Surfline)"):
         for item in forecasts:
             s = item["spot"]
             st.markdown(
@@ -127,7 +136,3 @@ if st.button("Make the Call", type="primary", use_container_width=True):
                 f"(~{item['est_drive_mins_each_way']}m drive + {item['walk_in_mins_each_way']}m walk)"
             )
             st.dataframe(pd.DataFrame(item["hourly_forecast"]), use_container_width=True, hide_index=True)
-    
-        matched = next((f["spot"] for f in forecasts if f["spot"]["name"] == decision.spot_name), None)
-    if matched and matched.get("surfline_url"):
-        st.link_button("Check Surfline Live Cam", matched["surfline_url"])
