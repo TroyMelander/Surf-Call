@@ -1,5 +1,7 @@
 import json
 import os
+from dotenv import load_dotenv
+load_dotenv()
 from typing import Literal
 from google import genai
 from google.genai import types
