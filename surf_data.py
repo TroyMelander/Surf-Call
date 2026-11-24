@@ -3,6 +3,8 @@ import math
 from datetime import date, datetime, timezone
 from pathlib import Path
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
@@ -14,6 +16,24 @@ SURFLINE_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+
+def _build_session() -> requests.Session:
+    """Shared HTTP session with automatic retries for transient SSL/timeout hiccups."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+SESSION = _build_session()
 
 
 def deg_to_compass(deg: float | None) -> str:
@@ -39,7 +59,6 @@ def tag_conditions(
     wind_mph: float | None,
     tide_ft: float | None,
 ) -> dict:
-    # Wind quality
     if wind_mph is None or wind_mph < 4:
         wind_q = "glassy"
     elif in_angle_range(wind_dir, spot["offshore_wind_deg"]):
@@ -47,7 +66,6 @@ def tag_conditions(
     else:
         wind_q = "onshore_or_cross"
 
-    # Tide fit
     t_low, t_high = spot["optimal_tide_ft"]
     if tide_ft is None:
         tide_q = "unknown"
@@ -58,7 +76,6 @@ def tag_conditions(
     else:
         tide_q = "too_high"
 
-    # Swell window
     swell_q = "in_window" if in_angle_range(swell_dir, spot["optimal_swell_deg"]) else "outside_window"
 
     return {"wind_quality": wind_q, "tide_fit": tide_q, "swell_fit": swell_q}
@@ -92,7 +109,7 @@ def fetch_noaa_tides(station_id: str, target_date: date) -> dict[str, dict]:
         "application": "SurfCallMVP",
         "format": "json",
     }
-    resp = requests.get(NOAA_URL, params=params, timeout=15)
+    resp = SESSION.get(NOAA_URL, params=params, timeout=20)
     resp.raise_for_status()
     preds = resp.json().get("predictions", [])
 
@@ -120,15 +137,15 @@ def fetch_surfline_overlay(spot_id: str | None, target_date: date) -> dict[str, 
         return {}
 
     days_ahead = max(1, (target_date - date.today()).days + 1)
-    if days_ahead > 5:  # Unofficial unauthenticated limit is typically 5 days
+    if days_ahead > 5:
         return {}
 
     params = {"spotId": spot_id, "days": days_ahead, "intervalHours": 1}
     overlay: dict[str, dict] = {}
 
     try:
-        w_resp = requests.get(SURFLINE_WAVE_URL, params=params, headers=SURFLINE_HEADERS, timeout=8)
-        r_resp = requests.get(SURFLINE_RATING_URL, params=params, headers=SURFLINE_HEADERS, timeout=8)
+        w_resp = SESSION.get(SURFLINE_WAVE_URL, params=params, headers=SURFLINE_HEADERS, timeout=8)
+        r_resp = SESSION.get(SURFLINE_RATING_URL, params=params, headers=SURFLINE_HEADERS, timeout=8)
         w_resp.raise_for_status()
         r_resp.raise_for_status()
 
@@ -146,7 +163,6 @@ def fetch_surfline_overlay(spot_id: str | None, target_date: date) -> dict[str, 
             if ts is None:
                 continue
 
-            # Convert Unix timestamp + Surfline's utcOffset to local 'YYYY-MM-DD HH:00'
             local_dt = datetime.fromtimestamp(ts + utc_offset * 3600, tz=timezone.utc)
             if local_dt.date() != target_date:
                 continue
@@ -160,26 +176,20 @@ def fetch_surfline_overlay(spot_id: str | None, target_date: date) -> dict[str, 
                 "surfline_rating": rating_by_ts.get(ts),
             }
     except Exception:
-        # Fail-safe: silently fall back to Open-Meteo + NOAA
         return {}
 
     return overlay
 
 
-def fetch_spot_forecast(
-    spot: dict,
-    target_date: date,
-    start_hour: int,
-    end_hour: int,
-    tides: dict,
-    use_surfline: bool = True,
-) -> list[dict]:
-    """Pulls Open-Meteo marine + weather data and merges with NOAA tides & optional Surfline data."""
+def fetch_open_meteo_batch(spots: list[dict], target_date: date) -> tuple[list[dict], list[dict]]:
+    """Fetches Open-Meteo marine + weather data for ALL spots in just 2 batched HTTP calls."""
     d_iso = target_date.isoformat()
+    lats = ",".join(str(s["lat"]) for s in spots)
+    lons = ",".join(str(s["lon"]) for s in spots)
 
     marine_params = {
-        "latitude": spot["lat"],
-        "longitude": spot["lon"],
+        "latitude": lats,
+        "longitude": lons,
         "hourly": ",".join([
             "wave_height",
             "swell_wave_height",
@@ -196,8 +206,8 @@ def fetch_spot_forecast(
         "end_date": d_iso,
     }
     weather_params = {
-        "latitude": spot["lat"],
-        "longitude": spot["lon"],
+        "latitude": lats,
+        "longitude": lons,
         "hourly": "wind_speed_10m,wind_direction_10m,wind_gusts_10m,temperature_2m",
         "wind_speed_unit": "mph",
         "temperature_unit": "fahrenheit",
@@ -206,10 +216,28 @@ def fetch_spot_forecast(
         "end_date": d_iso,
     }
 
-    m_data = requests.get(MARINE_URL, params=marine_params, timeout=15).json().get("hourly", {})
-    w_data = requests.get(WEATHER_URL, params=weather_params, timeout=15).json().get("hourly", {})
-    sl_overlay = fetch_surfline_overlay(spot.get("surfline_spot_id"), target_date) if use_surfline else {}
+    m_resp = SESSION.get(MARINE_URL, params=marine_params, timeout=25)
+    m_resp.raise_for_status()
+    m_json = m_resp.json()
+    m_list = [m_json] if isinstance(m_json, dict) else m_json
 
+    w_resp = SESSION.get(WEATHER_URL, params=weather_params, timeout=25)
+    w_resp.raise_for_status()
+    w_json = w_resp.json()
+    w_list = [w_json] if isinstance(w_json, dict) else w_json
+
+    return m_list, w_list
+
+
+def build_hourly_rows(
+    spot: dict,
+    m_data: dict,
+    w_data: dict,
+    tides: dict,
+    sl_overlay: dict,
+    start_hour: int,
+    end_hour: int,
+) -> list[dict]:
     times = m_data.get("time", [])
     rows = []
     for i, t_iso in enumerate(times):
@@ -261,27 +289,34 @@ def get_window_forecasts(
 ) -> list[dict]:
     """Filters spots by radius and returns merged forecast + logistics per spot."""
     spots = load_spots()
+    candidates = []
+    for spot in spots:
+        dist = haversine_miles(user_lat, user_lon, spot["lat"], spot["lon"])
+        if dist <= max_radius_miles:
+            candidates.append((dist, spot))
+
+    candidates.sort(key=lambda x: x[0])
+    if not candidates:
+        return []
+
+    filtered_spots = [spot for _, spot in candidates]
+    m_list, w_list = fetch_open_meteo_batch(filtered_spots, target_date)
+
     tide_cache: dict[str, dict] = {}
     results = []
 
-    for spot in spots:
-        dist = haversine_miles(user_lat, user_lon, spot["lat"], spot["lon"])
-        if dist > max_radius_miles:
-            continue
-
+    for idx, (dist, spot) in enumerate(candidates):
         station = spot["noaa_station"]
         if station not in tide_cache:
             tide_cache[station] = fetch_noaa_tides(station, target_date)
 
-        # Rough coastal drive estimate (no Google Maps key required for MVP)
+        sl_overlay = fetch_surfline_overlay(spot.get("surfline_spot_id"), target_date) if use_surfline else {}
+        m_data = m_list[idx].get("hourly", {})
+        w_data = w_list[idx].get("hourly", {})
+
         est_drive_mins = round(dist * 2.2 + 5)
-        hourly = fetch_spot_forecast(
-            spot,
-            target_date,
-            start_hour,
-            end_hour,
-            tide_cache[station],
-            use_surfline=use_surfline,
+        hourly = build_hourly_rows(
+            spot, m_data, w_data, tide_cache[station], sl_overlay, start_hour, end_hour
         )
 
         results.append({
@@ -293,11 +328,10 @@ def get_window_forecasts(
             "hourly_forecast": hourly,
         })
 
-    return sorted(results, key=lambda x: x["distance_miles"])
+    return results
 
 
 if __name__ == "__main__":
-    # Quick CLI smoke test
     data = get_window_forecasts(32.867, -117.213, 15.0, date.today(), 6, 10, use_surfline=True)
     print(f"Loaded {len(data)} spots within radius.")
     if data:
