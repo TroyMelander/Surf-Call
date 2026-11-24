@@ -1,59 +1,100 @@
-import json
 from datetime import date
-from pathlib import Path
+import os
 import pandas as pd
+import requests
 import streamlit as st
 
 from surf_data import get_window_forecasts
 from surf_brain import make_surf_call
 
-PROFILE_PATH = Path("profile.json")
-
-DEFAULT_PROFILE = {
-    "home_lat": 32.867,
-    "home_lon": -117.213,
-    "max_radius_miles": 15,
-    "skill_level": "intermediate",
-    "preferred_vibe": "clean peeling waves, mid-length friendly",
-    "quiver": ["7'6\" mid-length", "8'6\" funboard", "9'6\" longboard"],
-    "height_inches": 76,
-    "weight_lbs": 190,
-}
-
-
-def load_profile() -> dict:
-    if PROFILE_PATH.exists():
-        return {**DEFAULT_PROFILE, **json.loads(PROFILE_PATH.read_text())}
-    return DEFAULT_PROFILE.copy()
-
-
-def save_profile(profile: dict) -> None:
-    PROFILE_PATH.write_text(json.dumps(profile, indent=2))
-
-
 st.set_page_config(page_title="Surf Call", page_icon="🏄", layout="centered")
 st.title("🏄 Surf Call")
 st.caption("Zero-thinking surf recommender powered by Open-Meteo, NOAA Tides, Surfline & Gemini.")
 
-profile = load_profile()
 
-# --- SIDEBAR: Set Once, Adjust Anytime ---
+# --- CACHED HELPERS (Multi-User Safe) ---
+@st.cache_data(ttl=86400, show_spinner=False)
+def geocode_location(query: str) -> tuple[float, float, str] | None:
+    """Converts a zip code, neighborhood, or street address to (lat, lon, display_name)."""
+    try:
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "json", "limit": 1},
+            headers={"User-Agent": "SurfCallApp/1.0"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+        if not results:
+            return None
+        return float(results[0]["lat"]), float(results[0]["lon"]), results[0]["display_name"]
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_window_forecasts(
+    user_lat: float,
+    user_lon: float,
+    max_radius_miles: float,
+    target_date: date,
+    start_hour: int,
+    end_hour: int,
+    use_surfline: bool,
+) -> list[dict]:
+    """Caches weather, tide, and Surfline pulls for 30 minutes across concurrent users."""
+    return get_window_forecasts(
+        user_lat=user_lat,
+        user_lon=user_lon,
+        max_radius_miles=max_radius_miles,
+        target_date=target_date,
+        start_hour=start_hour,
+        end_hour=end_hour,
+        use_surfline=use_surfline,
+    )
+
+
+def get_gemini_api_key() -> str | None:
+    """Reads GEMINI_API_KEY from Streamlit Cloud Secrets first, then local .env/environment."""
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        pass
+    return os.environ.get("GEMINI_API_KEY")
+
+
+# --- LOAD DEFAULTS FROM URL QUERY PARAMS (Zero-Database Personalization) ---
+qp = st.query_params
+default_loc = qp.get("loc", "92122")
+default_radius = int(qp.get("radius", 15))
+default_skill = qp.get("skill", "intermediate")
+if default_skill not in ["beginner", "intermediate", "advanced"]:
+    default_skill = "intermediate"
+default_vibe = qp.get("vibe", "clean peeling waves, mid-length friendly")
+default_quiver = qp.get("quiver", "7'6\" mid-length|8'6\" funboard|9'6\" longboard").replace("|", "\n")
+default_height = int(qp.get("height", 76))
+default_weight = int(qp.get("weight", 190))
+
+# --- SIDEBAR: Set Once & Bookmark ---
 with st.sidebar:
     st.header("Your Setup (Set Once)")
-    col1, col2 = st.columns(2)
-    home_lat = col1.number_input("Home Lat", value=float(profile["home_lat"]), format="%.4f")
-    home_lon = col2.number_input("Home Lon", value=float(profile["home_lon"]), format="%.4f")
-    max_radius = st.slider("Max Radius (miles)", 3, 45, int(profile["max_radius_miles"]))
+    location_input = st.text_input(
+        "Starting Location (Zip, City, or Address)",
+        value=default_loc,
+        placeholder="e.g., 92122 or Pacific Beach, CA",
+    )
+    max_radius = st.slider("Max Radius (miles)", 3, 45, default_radius)
 
     skill = st.selectbox(
         "Skill Level",
         ["beginner", "intermediate", "advanced"],
-        index=["beginner", "intermediate", "advanced"].index(profile["skill_level"]),
+        index=["beginner", "intermediate", "advanced"].index(default_skill),
     )
-    vibe = st.text_input("Wave Vibe", value=profile["preferred_vibe"])
+    vibe = st.text_input("Wave Vibe", value=default_vibe)
     quiver_text = st.text_area(
         "Your Quiver (one board per line)",
-        value="\n".join(profile["quiver"]),
+        value=default_quiver,
         height=90,
     )
 
@@ -63,23 +104,21 @@ with st.sidebar:
     st.divider()
     st.caption("Optional (for board sizing tip)")
     c1, c2 = st.columns(2)
-    height_in = c1.number_input("Height (in)", 55, 84, int(profile["height_inches"]))
-    weight_lb = c2.number_input("Weight (lbs)", 90, 300, int(profile["weight_lbs"]))
+    height_in = c1.number_input("Height (in)", 55, 84, default_height)
+    weight_lb = c2.number_input("Weight (lbs)", 90, 300, default_weight)
 
-    if st.button("Save Setup", use_container_width=True):
-        updated = {
-            "home_lat": home_lat,
-            "home_lon": home_lon,
-            "max_radius_miles": max_radius,
-            "skill_level": skill,
-            "preferred_vibe": vibe,
-            "quiver": [b.strip() for b in quiver_text.splitlines() if b.strip()],
-            "height_inches": height_in,
-            "weight_lbs": weight_lb,
-        }
-        save_profile(updated)
-        profile = updated
-        st.success("Saved!")
+    if st.button("Save Setup to URL", use_container_width=True):
+        quiver_clean = "|".join(b.strip() for b in quiver_text.splitlines() if b.strip())
+        st.query_params.update({
+            "loc": location_input.strip(),
+            "radius": str(max_radius),
+            "skill": skill,
+            "vibe": vibe.strip(),
+            "quiver": quiver_clean,
+            "height": str(height_in),
+            "weight": str(weight_lb),
+        })
+        st.success("Saved! Bookmark this page URL to keep your setup.")
 
 # --- MAIN SCREEN: Minimal Inputs ---
 d_col, w_col = st.columns([1, 2])
@@ -90,10 +129,21 @@ window_mins = (end_hr - start_hr) * 60
 window_label = f"{target_date.strftime('%A, %b %d')} from {start_hr}:00 to {end_hr}:00"
 
 if st.button("Make the Call", type="primary", use_container_width=True):
-    with st.spinner("Checking swell, wind, tides, Surfline & drive times..."):
-        forecasts = get_window_forecasts(
-            user_lat=home_lat,
-            user_lon=home_lon,
+    if not location_input.strip():
+        st.error("Enter a starting zip code, neighborhood, or address in the sidebar.")
+        st.stop()
+
+    with st.spinner("Locating you & checking swell, wind, tides, Surfline & drive times..."):
+        geo = geocode_location(location_input.strip())
+        if not geo:
+            st.error(f"Couldn't find '{location_input}'. Try a zip code or 'City, CA'.")
+            st.stop()
+
+        user_lat, user_lon, resolved_name = geo
+
+        forecasts = cached_window_forecasts(
+            user_lat=round(user_lat, 3),  # Rounding improves cache hits for nearby users
+            user_lon=round(user_lon, 3),
             max_radius_miles=max_radius,
             target_date=target_date,
             start_hour=start_hr,
@@ -102,12 +152,29 @@ if st.button("Make the Call", type="primary", use_container_width=True):
         )
 
         if not forecasts:
-            st.warning("No breaks found within your radius. Increase your radius in the sidebar.")
+            st.warning(f"No breaks found within {max_radius} miles of {resolved_name}. Increase your radius.")
             st.stop()
 
-        decision = make_surf_call(profile, window_label, window_mins, forecasts)
+        profile = {
+            "starting_location": resolved_name,
+            "max_radius_miles": max_radius,
+            "skill_level": skill,
+            "preferred_vibe": vibe,
+            "quiver": [b.strip() for b in quiver_text.splitlines() if b.strip()],
+            "height_inches": height_in,
+            "weight_lbs": weight_lb,
+        }
+
+        decision = make_surf_call(
+            profile=profile,
+            window_label=window_label,
+            window_mins=window_mins,
+            spot_forecasts=forecasts,
+            api_key=get_gemini_api_key(),
+        )
 
     # --- VERDICT CARD ---
+    st.caption(f"📍 Starting from: {resolved_name}")
     badge_color = {"GO": "🟢", "MAYBE": "🟡", "SKIP": "🔴"}[decision.verdict]
     st.subheader(f"{badge_color} {decision.verdict} — {decision.spot_name}")
 
