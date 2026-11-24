@@ -8,6 +8,12 @@ MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 NOAA_URL = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
 
+from datetime import datetime, timezone
+
+SURFLINE_WAVE_URL = "https://services.surfline.com/kbyg/spots/forecasts/wave"
+SURFLINE_RATING_URL = "https://services.surfline.com/kbyg/spots/forecasts/rating"
+SURFLINE_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
 COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
 
@@ -106,6 +112,59 @@ def fetch_noaa_tides(station_id: str, target_date: date) -> dict[str, dict]:
         tides[item["t"]] = {"tide_ft": val, "tide_trend": trend}
     return tides
 
+def fetch_surfline_overlay(spot_id: str | None, target_date: date) -> dict[str, dict]:
+    """
+    Optionally fetches Surfline's unofficial hourly wave height & rating (POOR/FAIR/GOOD).
+    Returns a dict keyed by 'YYYY-MM-DD HH:00' in local time, or {} on any error.
+    """
+    if not spot_id:
+        return {}
+
+    days_ahead = max(1, (target_date - date.today()).days + 1)
+    if days_ahead > 5:  # Unofficial unauthenticated limit is typically 5 days
+        return {}
+
+    params = {"spotId": spot_id, "days": days_ahead, "intervalHours": 1}
+    overlay: dict[str, dict] = {}
+
+    try:
+        w_resp = requests.get(SURFLINE_WAVE_URL, params=params, headers=SURFLINE_HEADERS, timeout=8)
+        r_resp = requests.get(SURFLINE_RATING_URL, params=params, headers=SURFLINE_HEADERS, timeout=8)
+        w_resp.raise_for_status()
+        r_resp.raise_for_status()
+
+        waves = w_resp.json().get("data", {}).get("wave", [])
+        ratings = r_resp.json().get("data", {}).get("rating", [])
+
+        rating_by_ts = {
+            item["timestamp"]: item.get("rating", {}).get("key")
+            for item in ratings
+        }
+
+        for item in waves:
+            ts = item.get("timestamp")
+            utc_offset = item.get("utcOffset", -8)
+            if ts is None:
+                continue
+
+            # Convert Unix timestamp + Surfline's utcOffset to local 'YYYY-MM-DD HH:00'
+            local_dt = datetime.fromtimestamp(ts + utc_offset * 3600, tz=timezone.utc)
+            if local_dt.date() != target_date:
+                continue
+
+            key = local_dt.strftime("%Y-%m-%d %H:00")
+            surf = item.get("surf", {})
+            overlay[key] = {
+                "surfline_min_ft": surf.get("min"),
+                "surfline_max_ft": surf.get("max"),
+                "surfline_desc": surf.get("humanRelation"),
+                "surfline_rating": rating_by_ts.get(ts),
+            }
+    except Exception:
+        # Fail-safe: silently fall back to Open-Meteo + NOAA
+        return {}
+
+    return overlay
 
 def fetch_spot_forecast(
     spot: dict,
