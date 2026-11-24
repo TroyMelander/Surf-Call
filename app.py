@@ -127,3 +127,7 @@ if st.button("Make the Call", type="primary", use_container_width=True):
                 f"(~{item['est_drive_mins_each_way']}m drive + {item['walk_in_mins_each_way']}m walk)"
             )
             st.dataframe(pd.DataFrame(item["hourly_forecast"]), use_container_width=True, hide_index=True)
+    
+        matched = next((f["spot"] for f in forecasts if f["spot"]["name"] == decision.spot_name), None)
+    if matched and matched.get("surfline_url"):
+        st.link_button("Check Surfline Live Cam", matched["surfline_url"])
