@@ -22,11 +22,17 @@ class SurfDecision(BaseModel):
     )
 
 
-def make_surf_call(profile: dict, window_label: str, window_mins: int, spot_forecasts: list[dict], api_key: str | None = None) -> SurfDecision:
+def make_surf_call(
+    profile: dict,
+    window_label: str,
+    window_mins: int,
+    spot_forecasts: list[dict],
+    api_key: str | None = None,
+) -> SurfDecision:
     client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
 
     prompt = f"""
-You are a veteran local surf forecaster acting as a zero-friction decision engine.
+You are a veteran San Diego surf forecaster acting as a zero-friction decision engine.
 Your job: remove all thinking for the surfer and make ONE confident, honest call.
 
 SURFER PROFILE:
@@ -35,15 +41,19 @@ SURFER PROFILE:
 AVAILABLE WINDOW:
 {window_label} ({window_mins} total minutes available door-to-door)
 
-CANDIDATE BREAKS (Local Knowledge + Live Open-Meteo Marine/Weather + NOAA Tides):
+CANDIDATE BREAKS (Local Knowledge + Open-Meteo + NOAA Tides + Pre-Tagged Fits + Optional Surfline Ratings):
 {json.dumps(spot_forecasts, indent=2)}
 
 DECISION RULES:
-1. Cross-reference each break's `optimal_swell_deg`, `optimal_tide_ft`, `offshore_wind_deg`, and `notes` against the live hourly data.
-2. Respect logistics: subtract `round_trip_logistics_mins` from {window_mins} mins. Do NOT pick a spot that leaves fewer than 45 minutes in the water unless no better option exists.
-3. Match the wave steepness and swell period to the surfer's `quiver` and `preferred_vibe`.
-4. Be brutally honest: if winds are strong onshore (>12 mph from W/NW/SW) or swell is tiny/junky across all spots, return verdict="SKIP".
-5. Keep language crisp, natural, and local—no robotic filler.
+1. Trust the pre-computed hourly tags first: prioritize hours where `wind_quality` is "glassy" or "offshore", `tide_fit` is "optimal", and `swell_fit` is "in_window".
+2. Weigh Surfline data when present (`surfline_rating`, `surfline_min_ft`, `surfline_max_ft`, `surfline_desc`):
+   - Surfline models nearshore bathymetry/refraction better than raw offshore buoy data.
+   - If Open-Meteo shows solid swell but `surfline_rating` is "POOR" or "VERY_POOR" (or `surfline_max_ft` is <= 1 ft), downgrade the spot or flag the mismatch.
+   - If Surfline fields are missing for a spot, rely cleanly on Open-Meteo, NOAA tides, and the spot's `notes`.
+3. Respect logistics: subtract `round_trip_logistics_mins` from {window_mins} mins. Do NOT pick a spot that leaves fewer than 45 minutes in the water unless no better option exists.
+4. Match wave size, steepness, and swell period to the surfer's `quiver`, `skill_level`, and `preferred_vibe`. Never send a beginner/intermediate to a heavy reef (e.g., Windansea, Black's) on a pumping swell unless it fits their profile.
+5. Be brutally honest: if winds are strong onshore (>12 mph and `wind_quality` is "onshore_or_cross") or waves are tiny/junky across all spots, return verdict="SKIP" and spot_name="Stay Dry".
+6. Keep language crisp, natural, and local—no robotic filler.
 """
 
     response = client.models.generate_content(
