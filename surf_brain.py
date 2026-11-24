@@ -58,13 +58,31 @@ DECISION RULES:
 6. Keep language crisp, natural, and local—no robotic filler.
 """
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",  # <-- updated from gemini-2.5-flash
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=SurfDecision,
-            temperature=0.2,
-        ),
-    )
-    return SurfDecision.model_validate_json(response.text)
+    models_to_try = [
+        "gemini-3.8-flash",
+        "gemini-4-hydrogen",
+        "gemini-3.5-flash-lite",
+    ]
+
+    last_err = None
+    for model_name in models_to_try:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=SurfDecision,
+                        temperature=0.2,
+                    ),
+                )
+                return SurfDecision.model_validate_json(response.text)
+            except (errors.ServerError, errors.ClientError) as e:
+                last_err = e
+                if attempt == 0:
+                    time.sleep(1.5)
+                else:
+                    break  # Move immediately to the next fallback model
+
+    raise last_err
