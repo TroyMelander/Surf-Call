@@ -5,7 +5,7 @@ import requests
 import streamlit as st
 
 from surf_data import get_window_forecasts
-from surf_brain import make_surf_call
+from surf_brain import WindowCall, make_daily_digest, make_surf_call
 
 st.set_page_config(page_title="Surf Call", page_icon="🏄", layout="centered")
 st.title("🏄 Surf Call")
@@ -64,6 +64,20 @@ def get_gemini_api_key() -> str | None:
     return os.environ.get("GEMINI_API_KEY")
 
 
+def render_window_card(w: WindowCall, spot_urls: dict[str, str]) -> None:
+    badge = {"GO": "🟢 GO", "MAYBE": "🟡 MAYBE", "SKIP": "🔴 SKIP"}[w.verdict]
+    with st.container(border=True):
+        st.caption(w.window_name.upper())
+        st.subheader(f"{badge} — {w.spot_name}")
+        c1, c2 = st.columns(2)
+        c1.metric("Paddle Out", w.paddle_out_time)
+        c2.metric("Grab Board", w.recommended_board)
+        st.write(w.summary)
+        cam_url = spot_urls.get(w.spot_name)
+        if cam_url and w.verdict != "SKIP":
+            st.link_button("Check Surfline Live Cam", cam_url)
+
+
 # --- LOAD DEFAULTS FROM URL QUERY PARAMS (Zero-Database Personalization) ---
 qp = st.query_params
 default_loc = qp.get("loc", "92122")
@@ -120,13 +134,19 @@ with st.sidebar:
         })
         st.success("Saved! Bookmark this page URL to keep your setup.")
 
-# --- MAIN SCREEN: Minimal Inputs ---
-d_col, w_col = st.columns([1, 2])
+# --- MAIN SCREEN ---
+d_col, m_col = st.columns([1, 2])
 target_date = d_col.date_input("Day", value=date.today())
-start_hr, end_hr = w_col.slider("Available Window (24h)", 5, 20, (6, 10), format="%d:00")
+mode = m_col.radio(
+    "Call Mode",
+    ["Full Day (3-Window Split)", "Custom Time Window"],
+    horizontal=True,
+)
 
-window_mins = (end_hr - start_hr) * 60
-window_label = f"{target_date.strftime('%A, %b %d')} from {start_hr}:00 to {end_hr}:00"
+if mode == "Custom Time Window":
+    start_hr, end_hr = st.slider("Available Window (24h)", 5, 20, (6, 10), format="%d:00")
+else:
+    start_hr, end_hr = 6, 18
 
 if st.button("Make the Call", type="primary", use_container_width=True):
     if not location_input.strip():
@@ -142,7 +162,7 @@ if st.button("Make the Call", type="primary", use_container_width=True):
         user_lat, user_lon, resolved_name = geo
 
         forecasts = cached_window_forecasts(
-            user_lat=round(user_lat, 3),  # Rounding improves cache hits for nearby users
+            user_lat=round(user_lat, 3),
             user_lon=round(user_lon, 3),
             max_radius_miles=max_radius,
             target_date=target_date,
@@ -164,36 +184,53 @@ if st.button("Make the Call", type="primary", use_container_width=True):
             "height_inches": height_in,
             "weight_lbs": weight_lb,
         }
+        spot_urls = {f["spot"]["name"]: f["spot"].get("surfline_url", "") for f in forecasts}
 
-        decision = make_surf_call(
-            profile=profile,
-            window_label=window_label,
-            window_mins=window_mins,
-            spot_forecasts=forecasts,
-            api_key=get_gemini_api_key(),
-        )
+        if mode == "Full Day (3-Window Split)":
+            digest = make_daily_digest(
+                profile=profile,
+                target_date_str=target_date.strftime("%A, %b %d"),
+                full_day_forecasts=forecasts,
+                api_key=get_gemini_api_key(),
+            )
+        else:
+            window_mins = (end_hr - start_hr) * 60
+            window_label = f"{target_date.strftime('%A, %b %d')} from {start_hr}:00 to {end_hr}:00"
+            decision = make_surf_call(
+                profile=profile,
+                window_label=window_label,
+                window_mins=window_mins,
+                spot_forecasts=forecasts,
+                api_key=get_gemini_api_key(),
+            )
 
-    # --- VERDICT CARD ---
+    # --- RENDER OUTPUT ---
     st.caption(f"📍 Starting from: {resolved_name}")
-    badge_color = {"GO": "🟢", "MAYBE": "🟡", "SKIP": "🔴"}[decision.verdict]
-    st.subheader(f"{badge_color} {decision.verdict} — {decision.spot_name}")
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Paddle Out", decision.paddle_out_time)
-    m2.metric("Grab Board", decision.recommended_board)
-    m3.metric("Est. Water Time", f"~{decision.est_water_time_mins} min")
+    if mode == "Full Day (3-Window Split)":
+        st.info(digest.headline)
+        render_window_card(digest.dawn_patrol, spot_urls)
+        render_window_card(digest.mid_day, spot_urls)
+        render_window_card(digest.evening_glass_off, spot_urls)
+    else:
+        badge_color = {"GO": "🟢", "MAYBE": "🟡", "SKIP": "🔴"}[decision.verdict]
+        st.subheader(f"{badge_color} {decision.verdict} — {decision.spot_name}")
 
-    st.info(decision.the_call)
-    st.markdown(f"**Heads up:** {decision.watch_out}")
-    st.markdown(f"**Backup spot:** {decision.runner_up}")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Paddle Out", decision.paddle_out_time)
+        m2.metric("Grab Board", decision.recommended_board)
+        m3.metric("Est. Water Time", f"~{decision.est_water_time_mins} min")
 
-    # 1-Click Surfline Cam Link
-    matched = next((f["spot"] for f in forecasts if f["spot"]["name"] == decision.spot_name), None)
-    if matched and matched.get("surfline_url"):
-        st.link_button("Check Surfline Live Cam", matched["surfline_url"])
+        st.info(decision.the_call)
+        st.markdown(f"**Heads up:** {decision.watch_out}")
+        st.markdown(f"**Backup spot:** {decision.runner_up}")
 
-    with st.expander("Board Sizing & Volume Check"):
-        st.write(decision.board_sizing_tip)
+        cam_url = spot_urls.get(decision.spot_name)
+        if cam_url and decision.verdict != "SKIP":
+            st.link_button("Check Surfline Live Cam", cam_url)
+
+        with st.expander("Board Sizing & Volume Check"):
+            st.write(decision.board_sizing_tip)
 
     with st.expander("Raw Conditions Checked (Open-Meteo + NOAA + Surfline)"):
         for item in forecasts:
