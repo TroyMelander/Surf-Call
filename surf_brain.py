@@ -154,3 +154,97 @@ def _fallback_surf_call(profile: dict, window_mins: int, spot_forecasts: list[di
         runner_up=f"{runner} — next highest-scoring break in your radius.",
         board_sizing_tip=f"Defaulting to your {board} for ~{wave_ft} ft conditions.",
     )
+class WindowCall(BaseModel):
+    window_name: str = Field(description="e.g. 'Dawn Patrol (6–9 AM)', 'Mid-Day (10 AM–2 PM)', or 'Evening Glass-Off (3–6 PM)'.")
+    verdict: Literal["GO", "MAYBE", "SKIP"]
+    spot_name: str = Field(description="Best break for this window, or 'Stay Dry' if SKIP.")
+    paddle_out_time: str = Field(description="Exact recommended time, e.g. '6:30 AM', or 'N/A' if SKIP.")
+    recommended_board: str = Field(description="Best board from the surfer's quiver.")
+    summary: str = Field(description="1–2 crisp sentences explaining swell, wind, tide, and why this spot wins.")
+
+
+class DailyDigest(BaseModel):
+    headline: str = Field(description="1 punchy overall summary of today's San Diego surf, e.g. 'Clean dawn glass before onshore winds build by noon.'")
+    dawn_patrol: WindowCall
+    mid_day: WindowCall
+    evening_glass_off: WindowCall
+
+
+def make_daily_digest(
+    profile: dict,
+    target_date_str: str,
+    full_day_forecasts: list[dict],
+    api_key: str | None = None,
+) -> DailyDigest:
+    client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+
+    prompt = f"""
+You are a veteran San Diego surf forecaster writing a zero-fluff morning email digest for {target_date_str}.
+Evaluate the full-day forecast and make ONE confident call for each of these three windows:
+1. Dawn Patrol (6:00 AM – 9:00 AM, 180 mins total)
+2. Mid-Day (10:00 AM – 2:00 PM, 240 mins total)
+3. Evening Glass-Off (3:00 PM – 6:00 PM, 180 mins total)
+
+SURFER PROFILE:
+{json.dumps(profile, indent=2)}
+
+CANDIDATE BREAKS (6:00 AM – 6:00 PM Hourly Data):
+{json.dumps(full_day_forecasts, indent=2)}
+
+RULES:
+- Prioritize hours where `wind_quality` is "glassy" or "offshore", `tide_fit` is "optimal", and `swell_fit` is "in_window".
+- Weigh `surfline_rating` and `surfline_max_ft` when present.
+- Respect `round_trip_logistics_mins` so the surfer gets meaningful water time.
+- Match the surfer's `quiver`, `skill_level`, and `preferred_vibe`.
+- Be brutally honest: if a window is blown out (>12 mph onshore) or flat, return verdict="SKIP" and spot_name="Stay Dry".
+"""
+
+    models_to_try = [
+        "gemini-3.8-flash",
+        "gemini-4-hydrogen",
+        "gemini-3.5-flash-lite",
+    ]
+
+    for model_name in models_to_try:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=DailyDigest,
+                        temperature=0.2,
+                    ),
+                )
+                return DailyDigest.model_validate_json(response.text)
+            except (errors.ServerError, errors.ClientError) as e:
+                print(f"[SurfBrain Digest] {model_name} attempt {attempt + 1} failed: {e}")
+                if attempt == 0:
+                    time.sleep(1.5)
+                else:
+                    break
+
+    # Deterministic fallback if all Gemini models are 503
+    def _slice_window(start_h: int, end_h: int, label: str, mins: int) -> WindowCall:
+        sliced = []
+        for item in full_day_forecasts:
+            hrs = [h for h in item["hourly_forecast"] if start_h <= int(h["time"][:2]) <= end_h]
+            if hrs:
+                sliced.append({**item, "hourly_forecast": hrs})
+        fb = _fallback_surf_call(profile, mins, sliced)
+        return WindowCall(
+            window_name=label,
+            verdict=fb.verdict,
+            spot_name=fb.spot_name,
+            paddle_out_time=fb.paddle_out_time,
+            recommended_board=fb.recommended_board,
+            summary=fb.the_call,
+        )
+
+    return DailyDigest(
+        headline="Live buoy, NOAA tide, and Surfline call (Gemini API temporarily at capacity).",
+        dawn_patrol=_slice_window(6, 9, "Dawn Patrol (6–9 AM)", 180),
+        mid_day=_slice_window(10, 14, "Mid-Day (10 AM–2 PM)", 240),
+        evening_glass_off=_slice_window(15, 18, "Evening Glass-Off (3–6 PM)", 180),
+    )
