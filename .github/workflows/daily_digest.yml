@@ -1,0 +1,30 @@
+name: Daily Surf Call Digest
+
+on:
+  schedule:
+    # Runs daily at 5:30 AM PST (13:30 UTC). Change to '30 12 * * *' during Daylight Saving Time.
+    - cron: '30 13 * * *'
+  workflow_dispatch: # Allows you to test-run manually anytime from the GitHub Actions tab
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run 3-Window Surf Digest
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          SUBSCRIBERS_JSON: ${{ secrets.SUBSCRIBERS_JSON }}
+        run: python notify.py
