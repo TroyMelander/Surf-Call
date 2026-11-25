@@ -1,108 +1,163 @@
 import json
 import os
 import smtplib
-from datetime import date
-from email.message import EmailMessage
+from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import requests
+from dotenv import load_dotenv
 
 from surf_data import get_window_forecasts
-from surf_brain import make_surf_call
+from surf_brain import DailyDigest, WindowCall, make_daily_digest
 
-PROFILE_PATH = Path("profile.json")
+load_dotenv()
 
-DEFAULT_PROFILE = {
-    "home_lat": 32.867,
-    "home_lon": -117.213,
-    "max_radius_miles": 15,
-    "skill_level": "intermediate",
-    "preferred_vibe": "clean peeling waves, mid-length friendly",
-    "quiver": ["7'6\" mid-length", "8'6\" funboard", "9'6\" longboard"],
-    "height_inches": 76,
-    "weight_lbs": 190,
-}
+PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
 
-def load_profile() -> dict:
-    if PROFILE_PATH.exists():
-        return {**DEFAULT_PROFILE, **json.loads(PROFILE_PATH.read_text())}
-    return DEFAULT_PROFILE.copy()
+def load_subscribers() -> list[dict]:
+    """Reads subscribers from GitHub Secret SUBSCRIBERS_JSON first, then local subscribers.json."""
+    env_json = os.environ.get("SUBSCRIBERS_JSON")
+    if env_json:
+        return json.loads(env_json)
+    local_path = Path("subscribers.json")
+    if local_path.exists():
+        return json.loads(local_path.read_text())
+    raise RuntimeError("No subscribers found. Set SUBSCRIBERS_JSON or create subscribers.json.")
 
 
-def format_message(decision) -> tuple[str, str]:
-    badge = {"GO": "🟢 GO", "MAYBE": "🟡 MAYBE", "SKIP": "🔴 SKIP"}[decision.verdict]
-    title = f"{badge}: {decision.spot_name} @ {decision.paddle_out_time}"
-    body = (
-        f"Board: {decision.recommended_board} (~{decision.est_water_time_mins} min water time)\n\n"
-        f"{decision.the_call}\n\n"
-        f"Heads up: {decision.watch_out}\n"
-        f"Backup: {decision.runner_up}"
-    )
-    return title, body
-
-
-def send_ntfy(topic: str, title: str, body: str, verdict: str) -> None:
-    priority = "high" if verdict == "GO" else "default"
-    requests.post(
-        f"https://ntfy.sh/{topic}",
-        data=body.encode("utf-8"),
-        headers={"Title": title.encode("utf-8"), "Priority": priority, "Tags": "ocean"},
+def geocode_location(query: str) -> tuple[float, float, str]:
+    resp = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": query, "format": "json", "limit": 1},
+        headers={"User-Agent": "SurfCallDigest/1.0"},
         timeout=10,
-    ).raise_for_status()
+    )
+    resp.raise_for_status()
+    results = resp.json()
+    if not results:
+        raise ValueError(f"Could not geocode location: {query}")
+    return float(results[0]["lat"]), float(results[0]["lon"]), results[0]["display_name"]
 
 
-def send_email(to_addr: str, from_addr: str, app_password: str, subject: str, body: str) -> None:
-    msg = EmailMessage()
+def build_html_email(
+    sub_name: str,
+    date_str: str,
+    digest: DailyDigest,
+    spot_urls: dict[str, str],
+) -> str:
+    badge_styles = {
+        "GO": ("#16a34a", "🟢 GO"),
+        "MAYBE": ("#ca8a04", "🟡 MAYBE"),
+        "SKIP": ("#dc2626", "🔴 SKIP"),
+    }
+
+    def render_card(w: WindowCall) -> str:
+        color, badge = badge_styles[w.verdict]
+        cam_url = spot_urls.get(w.spot_name)
+        cam_btn = (
+            f'<p style="margin:8px 0 0 0;"><a href="{cam_url}" style="color:#2563eb;text-decoration:none;font-weight:600;">📹 Check Surfline Live Cam →</a></p>'
+            if cam_url and w.verdict != "SKIP"
+            else ""
+        )
+        return f"""
+        <div style="border:1px solid #e5e7eb;border-left:5px solid {color};border-radius:8px;padding:14px 16px;margin-bottom:14px;background:#ffffff;">
+            <div style="font-size:12px;text-transform:uppercase;letter-spacing:0.5px;color:#6b7280;font-weight:700;">{w.window_name}</div>
+            <div style="font-size:18px;font-weight:700;margin:4px 0 6px 0;color:#111827;">{badge} — {w.spot_name}</div>
+            <div style="font-size:13px;color:#374151;margin-bottom:8px;">
+                <strong>Paddle Out:</strong> {w.paddle_out_time} &nbsp;|&nbsp; <strong>Board:</strong> {w.recommended_board}
+            </div>
+            <p style="margin:0;font-size:14px;line-height:1.45;color:#1f2937;">{w.summary}</p>
+            {cam_btn}
+        </div>
+        """
+
+    cards_html = (
+        render_card(digest.dawn_patrol)
+        + render_card(digest.mid_day)
+        + render_card(digest.evening_glass_off)
+    )
+
+    return f"""
+    <html>
+      <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f9fafb;padding:20px;color:#111827;">
+        <div style="max-width:560px;margin:0 auto;">
+          <h2 style="margin:0 0 4px 0;">🏄 Surf Call — {date_str}</h2>
+          <p style="margin:0 0 16px 0;color:#4b5563;font-size:14px;">Hey {sub_name} — {digest.headline}</p>
+          {cards_html}
+          <p style="font-size:12px;color:#9ca3af;margin-top:20px;">
+            Powered by Open-Meteo, NOAA Tides, Surfline & Gemini.
+          </p>
+        </div>
+      </body>
+    </html>
+    """
+
+
+def send_email(to_email: str, subject: str, html_body: str) -> None:
+    gmail_user = os.environ["GMAIL_USER"]
+    gmail_pass = os.environ["GMAIL_APP_PASSWORD"]
+
+    msg = MIMEMultipart("alternative")
+    msg["From"] = f"Surf Call <{gmail_user}>"
+    msg["To"] = to_email
     msg["Subject"] = subject
-    msg["From"] = from_addr
-    msg["To"] = to_addr
-    msg.set_content(body)
+    msg.attach(MIMEText(html_body, "html"))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(from_addr, app_password)
-        smtp.send_message(msg)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(gmail_user, gmail_pass)
+        server.sendmail(gmail_user, to_email, msg.as_string())
 
 
 def main() -> None:
-    profile = load_profile()
-    today = date.today()
-    start_hr = int(os.getenv("SURF_START_HOUR", "6"))
-    end_hr = int(os.getenv("SURF_END_HOUR", "10"))
-    window_mins = (end_hr - start_hr) * 60
-    window_label = f"{today.strftime('%A, %b %d')} from {start_hr}:00 to {end_hr}:00"
+    today = datetime.now(PACIFIC_TZ).date()
+    date_str = today.strftime("%A, %b %d")
+    subscribers = load_subscribers()
 
-    forecasts = get_window_forecasts(
-        user_lat=profile["home_lat"],
-        user_lon=profile["home_lon"],
-        max_radius_miles=profile["max_radius_miles"],
-        target_date=today,
-        start_hour=start_hr,
-        end_hour=end_hr,
-    )
-    if not forecasts:
-        print("No spots within radius.")
-        return
+    # Cache geocoding and forecasts per unique (location, radius)
+    geo_cache: dict[str, tuple[float, float, str]] = {}
+    forecast_cache: dict[tuple[str, int], list[dict]] = {}
 
-    decision = make_surf_call(profile, window_label, window_mins, forecasts)
-    title, body = format_message(decision)
-    print(f"\n{title}\n{'-' * 40}\n{body}\n")
+    for sub in subscribers:
+        loc = sub["location"]
+        radius = int(sub.get("max_radius_miles", 15))
 
-    # Optional: skip sending notifications on SKIP days if QUIET_ON_SKIP=true
-    if os.getenv("QUIET_ON_SKIP", "false").lower() == "true" and decision.verdict == "SKIP":
-        print("Verdict is SKIP and QUIET_ON_SKIP is enabled. Skipping notification.")
-        return
+        if loc not in geo_cache:
+            geo_cache[loc] = geocode_location(loc)
+        lat, lon, resolved_name = geo_cache[loc]
 
-    ntfy_topic = os.getenv("NTFY_TOPIC")
-    if ntfy_topic:
-        send_ntfy(ntfy_topic, title, body, decision.verdict)
-        print(f"Sent ntfy push to topic: {ntfy_topic}")
+        cache_key = (loc, radius)
+        if cache_key not in forecast_cache:
+            forecast_cache[cache_key] = get_window_forecasts(
+                user_lat=lat,
+                user_lon=lon,
+                max_radius_miles=radius,
+                target_date=today,
+                start_hour=6,
+                end_hour=18,
+                use_surfline=True,
+            )
 
-    email_to = os.getenv("EMAIL_TO")
-    email_from = os.getenv("EMAIL_FROM")
-    email_pass = os.getenv("EMAIL_APP_PASSWORD")
-    if email_to and email_from and email_pass:
-        send_email(email_to, email_from, email_pass, title, body)
-        print(f"Sent email to: {email_to}")
+        forecasts = forecast_cache[cache_key]
+        if not forecasts:
+            print(f"[Skip] No spots within {radius} mi of {resolved_name} for {sub['name']}")
+            continue
+
+        digest = make_daily_digest(
+            profile=sub,
+            target_date_str=date_str,
+            full_day_forecasts=forecasts,
+        )
+
+        spot_urls = {f["spot"]["name"]: f["spot"].get("surfline_url", "") for f in forecasts}
+        top_verdict = digest.dawn_patrol.verdict
+        subject = f"🏄 Surf Call ({date_str}): {top_verdict} Dawn Patrol — {digest.dawn_patrol.spot_name}"
+        html = build_html_email(sub["name"], date_str, digest, spot_urls)
+
+        send_email(sub["email"], subject, html)
+        print(f"[Sent] Digest emailed to {sub['name']} ({sub['email']})")
 
 
 if __name__ == "__main__":
